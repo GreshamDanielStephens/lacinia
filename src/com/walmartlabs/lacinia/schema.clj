@@ -22,21 +22,21 @@
   schema, and pre-computing many defaults."
   (:refer-clojure :exclude [compile])
   (:require
-   [clojure.spec.alpha :as s]
-   [com.walmartlabs.lacinia.introspection :as introspection]
-   [com.walmartlabs.lacinia.internal-utils
-    :refer [map-vals map-kvs filter-vals deep-map-merge q get-nested
-            is-internal-type-name? sequential-or-set? as-keyword
-            cond-let ->TaggedValue is-tagged-value? extract-value extract-type-tag
-            to-message qualified-name fast-map-indexed]]
-   [com.walmartlabs.lacinia.select-utils :as su]
-   [com.walmartlabs.lacinia.resolve :as resolve
-    :refer [ResolverResult resolve-as is-resolver-result?]]
-   [com.walmartlabs.lacinia.resolve-utils :refer [aggregate-results]]
-   [clojure.string :as str]
-   [clojure.set :refer [difference]]
-   [clojure.pprint :as pprint]
-   [com.walmartlabs.lacinia.selection :as selection])
+    [clojure.spec.alpha :as s]
+    [com.walmartlabs.lacinia.introspection :as introspection]
+    [com.walmartlabs.lacinia.internal-utils
+     :refer [map-vals map-kvs filter-vals deep-map-merge q get-nested
+             is-internal-type-name? sequential-or-set? as-keyword
+             cond-let ->TaggedValue is-tagged-value? extract-value extract-type-tag
+             to-message qualified-name fast-map-indexed]]
+    [com.walmartlabs.lacinia.select-utils :as su]
+    [com.walmartlabs.lacinia.resolve :as resolve
+     :refer [ResolverResult on-deliver! resolve-as is-resolver-result?]]
+    [com.walmartlabs.lacinia.resolve-utils :refer [aggregate-results]]
+    [clojure.string :as str]
+    [clojure.set :refer [difference]]
+    [clojure.pprint :as pprint]
+    [com.walmartlabs.lacinia.selection :as selection])
   (:import
     (clojure.lang IObj PersistentQueue)
     (java.io Writer)))
@@ -1309,6 +1309,72 @@
                :direct-fn direct-fn)
         (provide-default-arg-descriptions schema type-def))))
 
+(defn ^:private apply-directive
+  [schema options dir-location-def directive-location default-resolve-fn {:keys [directive-type arguments]} more-context]
+  (let [directive-fn-or-fn-map (get-in options [:apply-directives directive-type])
+        directive-fn (if (map? directive-fn-or-fn-map)
+                       (get directive-fn-or-fn-map directive-location)
+                       directive-fn-or-fn-map)
+
+        input-def (merge more-context
+                         {:resolve default-resolve-fn
+                          :compiled-schema schema}
+                         dir-location-def)
+
+        resulting-def (if directive-fn
+                        (dissoc (directive-fn input-def arguments)
+                                :compiled-schema)
+                        dir-location-def)]
+    (if (= default-resolve-fn (:resolve resulting-def))
+      (dissoc resulting-def :resolve)
+      resulting-def)))
+
+(defn ^:private apply-directives
+  ([schema options dir-location-def directive-location default-resolve-fn directives more-context]
+   (reduce (fn [temp-type-def directive]
+             (apply-directive schema options temp-type-def directive-location
+                              default-resolve-fn
+                              directive more-context))
+           dir-location-def
+           (mapcat val directives)))
+  ([schema options dir-location-def directive-location default-resolve-fn directives]
+   (apply-directives schema options dir-location-def directive-location default-resolve-fn directives nil)))
+
+(defn ^:private root-type
+  [t-def]
+  (if (keyword? t-def)
+    t-def
+    (recur (:type t-def))))
+
+(defrecord ^:private ResolverResultMap [resolver-result mapping-fn]
+  ResolverResult
+  (on-deliver! [this callback]
+    (on-deliver! ^ResolverResult resolver-result (fn [x] (callback (mapping-fn x))))
+    this))
+
+(defn ^:private prepare-field-def-with-directives
+  [schema options field-def]
+  ;; TODO input arg directives
+  (let [field-def' (apply-directives schema options
+                                     field-def
+                                     :field-definition
+                                     nil
+                                     (:compiled-directives field-def))
+        resolve (wrap-resolver-to-ensure-resolver-result (:resolve field-def'))
+
+        root-type (root-type field-def)
+        root-type-resolve (get-in schema [root-type :resolve])
+
+
+        resolve' (if root-type-resolve
+                   (fn [ctx args parent]
+                     (let [resolver-result (resolve ctx args parent)]
+                       (->ResolverResultMap resolver-result #(do
+                                                               (println %)
+                                                               (root-type-resolve ctx args parent %)))))
+                   resolve)]
+    (assoc field-def :resolve resolve')))
+
 (defn ^:private prepare-field-resolver
   [schema options field-def]
   (let [{:keys [default-field-resolver apply-field-directives]} options
@@ -1318,11 +1384,12 @@
         resolver' (if-not (and apply-field-directives
                             (seq compiled-directives))
                     resolver
-                    (or (apply-field-directives (assoc field-def :compiled-schema schema) (resolve/as-resolver-fn resolver))
-                      resolver))
-        direct-fn (-> resolver' meta ::direct-fn)]
-    (assoc field-def :resolve (wrap-resolver-to-ensure-resolver-result resolver')
-                     :direct-fn direct-fn)))
+                    (or (apply-field-directives (assoc field-def :compiled-schema schema)
+                                                (resolve/as-resolver-fn resolver))
+                        resolver))
+        field-def' (prepare-field-def-with-directives schema options (assoc field-def :resolve resolver'))
+        direct-fn (-> field-def' :resolve meta ::direct-fn)]
+    (assoc field-def' :direct-fn direct-fn)))
 
 ;;-------------------------------------------------------------------------------
 ;; ## Compile schema
@@ -1745,10 +1812,130 @@
   [schema object-def options]
   (update-fields-in-object object-def #(prepare-field-resolver schema options %)))
 
-(defn ^:private prepare-field-resolvers
+(defn ^:private prepare-default-with-directives
+  [schema options {:keys [category compiled-directives] :as o}]
+  (apply-directives schema options
+                    o
+                    category
+                    (fn [_ctx _args _parent val] val)
+                    compiled-directives))
+
+(defn ^:private prepare-enum-with-directives
+  [schema options {:keys [compiled-directives values-detail] :as enum-def}]
+  (let [with-enum-directives (apply-directives schema options enum-def :enum
+                                               (fn [_ctx _args _parent val] val)
+                                               compiled-directives)
+        with-enum-val-directives (reduce
+                                   (fn [temp-enum-def [enum-value {:keys [compiled-directives]}]]
+                                     (apply-directives schema options temp-enum-def :enum-value
+                                                       (fn [_ctx _args _parent val] val)
+                                                       compiled-directives
+                                                       {:enum-value enum-value}))
+                                   with-enum-directives
+                                   values-detail)]
+    with-enum-val-directives))
+
+(defn concrete-union-members
+  [schema union-def]
+  (->> (:members union-def)
+       (mapcat (fn [m]
+                 (let [member (get schema m)]
+                   (if (= :union (:category member))
+                     (concrete-union-members schema member)
+                     [m]))))
+       distinct))
+
+(defn ^:private get-tag
+  [v]
+  (if (is-tagged-value? v)
+    (extract-type-tag v)
+    (-> v meta ::type-name)))
+
+(defn ^:private prepare-union-with-directives
+  [schema options {:keys [compiled-directives] :as union-def}]
+  (let [union-def' (apply-directives schema options union-def :union (fn [_ctx _args _parent val]
+                                                                       val)
+                                     compiled-directives)
+        union-resolve (:resolve union-def')
+
+        base-resolves (->> (concrete-union-members schema union-def')
+                           (map #(get schema %))
+                           (filter :resolve)
+                           (map (fn [{:keys [type-name resolve]}]
+                                  [type-name resolve]))
+                           (into {}))
+        base-resolve (if (seq base-resolves)
+                       (fn [ctx args parent val]
+                         (if-let [delegate (get base-resolves (get-tag val))]
+                           (delegate ctx args parent val)
+                           val))
+                       nil)
+
+        resolve' (cond
+                   (and base-resolve union-resolve)
+                   (fn [ctx args parent val]
+                     (base-resolve ctx args parent (union-resolve ctx args parent val)))
+
+                   base-resolve base-resolve
+                   :else union-resolve)
+        ]
+    (assoc union-def' :resolve resolve')))
+
+(defn ^:private prepare-object-with-directives
+  [schema options {:keys [compiled-directives] :as obj-def}]
+  (let [obj-def' (apply-directives schema options obj-def :object (fn [_ctx _args _parent val] val) compiled-directives)
+        obj-resolve (:resolve obj-def')
+
+        ;; TODO inherit field directives too
+        base-resolves (->> (:implements obj-def')
+                           (map #(get schema %))
+                           (keep :resolve))
+        base-resolve (when (seq base-resolves)
+                       (reduce
+                         (fn [f1 f2]
+                           (fn [ctx args parent val]
+                             (f1 ctx args parent (f2 ctx args parent val))))
+                         base-resolves))
+
+        resolve' (cond
+                   (and base-resolve obj-resolve)
+                   (fn [ctx args parent val]
+                     (base-resolve ctx args parent (obj-resolve ctx args parent val)))
+
+                   base-resolve base-resolve
+                   :else obj-resolve)]
+    (assoc obj-def' :resolve resolve')))
+
+(defn ^:private prepare-type-def-with-directives
+  [schema options category type-fn preparation-fn]
+  (map-types schema category #(type-fn (preparation-fn schema options %))))
+
+(defn ^:private prepare-top-defs-with-directives
+  [schema options]
+  ;; Order here matters, it should match the possible dependencies allowed in graphql
+  (-> schema
+      ;; can't depend on anything
+      (prepare-type-def-with-directives options :enum map->EnumType prepare-enum-with-directives)
+      (prepare-type-def-with-directives options :scalar map->Scalar prepare-default-with-directives)
+      (prepare-type-def-with-directives options :interface map->Interface prepare-default-with-directives)
+      ;; can implement interfaces
+      (prepare-type-def-with-directives options :object map->Type prepare-object-with-directives)
+      ;; can union objects
+      (prepare-type-def-with-directives options :union map->Union prepare-union-with-directives)
+
+      ;; TODO input-objects
+      ))
+
+(defn ^:private prepare-objects-fields
   [schema options]
   (map-types schema :object
              #(prepare-resolvers-in-object schema % options)))
+
+(defn ^:private prepare-resolvers
+  [schema options]
+  (-> schema
+      (prepare-top-defs-with-directives options)
+      (prepare-objects-fields options)))
 
 (defn ^:private inject-null-collapsers
   [schema]
@@ -1903,7 +2090,7 @@
         validate-enum-directives
         inject-null-collapsers
         ;; Last so that schema is as close to final and verified state as possible
-        (prepare-field-resolvers options)
+        (prepare-resolvers options)
         map->CompiledSchema)))
 
 (defn default-field-resolver

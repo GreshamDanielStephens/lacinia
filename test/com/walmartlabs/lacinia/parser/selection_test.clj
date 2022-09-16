@@ -24,7 +24,9 @@
     [clojure.java.io :as io]
     [com.walmartlabs.lacinia.util :as util]
     [clojure.string :as str]
-    [com.walmartlabs.lacinia.resolve :as resolve])
+    [com.walmartlabs.lacinia.resolve :as resolve]
+    [com.walmartlabs.lacinia.internal-utils :as internal-utils]
+    [clojure.walk :as walk])
   (:import
     (java.util UUID)))
 
@@ -411,3 +413,90 @@
                    ;; resolver was used:
                    :asis "Lacinia"}}
            (execute schema q {:input "Lacinia"} nil)))))
+
+(defn get-tag
+  [v]
+  (if (internal-utils/is-tagged-value? v)
+    (internal-utils/extract-type-tag v)
+    (-> v meta ::schema/type-name)))
+
+(defn add-trace-resolve
+  [type-def {:keys [id] :as _directive-args}]
+  (update type-def :resolve (fn [resolver]
+                              (fn [& resolver-args]
+                                ;(println (walk/postwalk
+                                ;           (fn [x] (if (string? x)
+                                ;                     (format "%s[%s]" x id)
+                                ;                     x))
+                                ;           (apply resolver resolver-args)))
+                                (let [v (apply resolver resolver-args)
+                                      t (get-tag v)
+                                      v' (walk/postwalk
+                                          (fn [x] (if (string? x)
+                                                    (format "%s[%s]" x id)
+                                                    x))
+                                          v)
+                                      t' (get-tag v')]
+                                  (if (and t (not t'))
+                                    (schema/tag-with-type v' t)
+                                    v'))))))
+
+(deftest application-of-directives-to-fields2
+  (let [mut (fn [_ {{email :email} :user} _]
+              (let [x (if (re-find #" " email)
+                        (schema/tag-with-type {:code "code"
+                                               :message "message"
+                                               :input {:email email}
+                                               :here :RegisterError}
+                                              :RegisterError)
+                        (schema/tag-with-type {:id "user-name"
+                                               :email email
+                                               :type :NORMAL
+                                               :here :User}
+                                              :User))]
+                (println "??????")
+                (println (when (internal-utils/is-tagged-value? x)
+                           (internal-utils/extract-type-tag x)))
+                x))
+        schema (compile-sdl-schema "selection/directive-types.graphql"
+                                   {:Mutation/register mut}
+                                   {:apply-directives {:trace add-trace-resolve
+                                                       #_#_:upperCase (fn [type-def args]
+                                                                        (assoc type-def :resolve
+                                                                                        (fn [ctx args {:keys [email]}]
+                                                                                          (str/upper-case email))))
+                                                       #_#_:validEmail trace-directive-fn
+                                                       #_#_:sqlResolver trace-directive-fn
+                                                       #_#_:replaced (fn [enum-def-schema {:keys [newValue]}]
+                                                                       (fn [_ctx _val]
+                                                                         (keyword newValue)))
+                                                       }})
+        m "
+        mutation ($input : UserInput!) {
+          register(user: $input) {
+            __typename
+            ... on User {
+              id email type
+            }
+            ... on RegisterError {
+              code
+              message
+              input {
+                email
+              }
+            }
+          }
+        }
+        "]
+    (is (= {:data {:register {:__typename :User
+                              :email "some-email@email.com[FieldDef Mutation.register][Union RegisterResult][Type User][FieldDef User.email]"
+                              :id "user-name[FieldDef Mutation.register][Union RegisterResult][Type User]"
+                              :type :NORMAL}}}
+           (execute schema m {:input {:email "some-email@email.com"}} nil)))
+
+    (is (= {:data {:register {:__typename :RegisterError
+                              ;; TODO code doesn't hit the directive for the interface field on Error, does this matter?
+                              :code "code[FieldDef Mutation.register][Type RegisterError]"
+                              :input {:email "some invalid email[FieldDef Mutation.register][FieldDef RegisterError.input][FieldDef UserInputRef.email]"}
+                              :message "message[FieldDef Mutation.register][FieldDef RegisterError.message]"}}}
+           (execute schema m {:input {:email "some invalid email"}} nil)))))

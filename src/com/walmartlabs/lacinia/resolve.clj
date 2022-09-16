@@ -264,7 +264,7 @@
       (resolve-value field-resolver context args value))
 
     :else
-    (throw (ex-info "Not a field resolver function of FieldResolver instance."
+    (throw (ex-info "Not a field resolver function or FieldResolver instance."
              {:field-resolver field-resolver}))))
 
 (defn wrap-resolver-result
