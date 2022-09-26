@@ -1,0 +1,45 @@
+directive @replaced(oldValue: String, newValue: String!) on ENUM | ENUM_VALUE
+directive @trace(id: String!) on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | INPUT_OBJECT | INTERFACE | OBJECT | SCALAR | UNION # | SCHEMA
+
+enum UserType @replaced(oldValue: "SUPER", newValue: "ADMIN") {
+  SUPER
+  ADMIN
+
+  NORMAL @replaced(newValue: "STANDARD")
+  STANDARD
+}
+
+input UserInput @trace(id: "Input UserInput") {
+  email: String! @trace(id: "InputFieldDef UserInput.email")
+}
+
+type UserInputRef @trace(id: "Type UserInputRef") {
+  email: String! @trace(id: "FieldDef UserInputRef.email")
+}
+
+type User @trace(id: "Type User") {
+  id: String!
+  email: String! @trace(id: "FieldDef User.email")
+  type: UserType!
+}
+
+interface Error @trace(id: "Interface Error") {
+  code: String! @trace(id: "FieldDef Error.code")
+  message: String!
+}
+
+type RegisterError implements Error @trace(id: "Type RegisterError") {
+  code: String!
+  message: String! @trace(id: "FieldDef RegisterError.message")
+  input: UserInputRef! @trace(id: "FieldDef RegisterError.input")
+}
+
+type Query {
+  users(id: String! @trace(id: "ArgDef Query.users.id")) : User @trace(id: "FieldDef Query.users")
+}
+
+union RegisterResult @trace(id: "Union RegisterResult") = User | RegisterError
+
+type Mutation {
+  register(user: UserInput! @trace(id: "ArgDef Mutation.register.user")) : RegisterResult! @trace(id: "FieldDef Mutation.register")
+}
